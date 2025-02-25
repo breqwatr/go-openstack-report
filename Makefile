@@ -10,20 +10,20 @@ all: build
 
 # Build the project
 build:
-	$(GOBUILD) -o $(BINARY_NAME) -v  # <-- ✅ TAB here
+	$(GOBUILD) -o $(BINARY_NAME) -v
 
 # Clean build files
 clean:
-	$(GOCLEAN)                       # <-- ✅ TAB here
-	rm -f $(BINARY_NAME)              # <-- ✅ TAB here
+	$(GOCLEAN)
+	rm -f $(BINARY_NAME)
 
 # Install dependencies
 deps:
-	$(GOGET) -v ./...                 # <-- ✅ TAB here
+	$(GOGET) -v ./...
 
 # Run the application
 run:
-	$(GOBUILD) -o $(BINARY_NAME) -v  # <-- ✅ TAB here
-	./$(BINARY_NAME)                  # <-- ✅ TAB here
+	$(GOBUILD) -o $(BINARY_NAME) -v
+	./$(BINARY_NAME)
 
 .PHONY: all build clean deps run
