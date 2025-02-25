@@ -15,6 +15,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
@@ -43,6 +44,7 @@ type Summary struct {
 	TotalStorage       int
 	UnallocatedStorage int
 	TotalFloatingIPs   int
+	TotalSnapshots     int
 	LicenseCounts      map[string]int
 	TotalVCPUs         int
 	TotalRAM           int
@@ -76,6 +78,7 @@ func main() {
 	allPorts, _ := listPorts(ctx, networkClient)
 	allVolumes, _ := listVolumes(ctx, storageClient)
 	allFIPs, _ := listFloatingIPs(ctx, networkClient)
+	allSnapshots, _ := listSnapshots(ctx, storageClient)
 
 	flavorMap := make(map[string]string)
 	for _, flavor := range allFlavors {
@@ -92,7 +95,7 @@ func main() {
 	unallocatedStorage, unallocatedDisks, unallocatedDiskSizes := calculateUnallocatedStorage(allVolumes)
 	report := generateReport(allVMs, allPorts, allVolumes, portToFIP, flavorMap)
 
-	summaryData := generateSummary(report, unallocatedStorage, unallocatedDisks, unallocatedDiskSizes)
+	summaryData := generateSummary(report, unallocatedStorage, unallocatedDisks, unallocatedDiskSizes, allSnapshots)
 	writeExcel(report, unallocatedStorage, unallocatedDisks, unallocatedDiskSizes, summaryData)
 }
 
@@ -137,6 +140,14 @@ func listFloatingIPs(ctx context.Context, client *gophercloud.ServiceClient) ([]
 		return nil, err
 	}
 	return floatingips.ExtractFloatingIPs(allPages)
+}
+
+func listSnapshots(ctx context.Context, client *gophercloud.ServiceClient) ([]snapshots.Snapshot, error) {
+	allPages, err := snapshots.List(client, nil).AllPages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snapshots.ExtractSnapshots(allPages)
 }
 
 func calculateUnallocatedStorage(vols []volumes.Volume) (int, []string, []int) {
@@ -221,12 +232,13 @@ func generateReport(vms []FixedServer, ports []ports.Port, vols []volumes.Volume
 	return report
 }
 
-func generateSummary(report []Report, unallocatedStorage int, unallocatedDisks []string, unallocatedDiskSizes []int) Summary {
+func generateSummary(report []Report, unallocatedStorage int, unallocatedDisks []string, unallocatedDiskSizes []int, allSnapshots []snapshots.Snapshot) Summary {
 	summary := Summary{
 		VMCount:            len(report),
 		TotalStorage:       0,
 		UnallocatedStorage: unallocatedStorage,
 		TotalFloatingIPs:   0,
+		TotalSnapshots:     len(allSnapshots),
 		LicenseCounts:      make(map[string]int),
 		TotalVCPUs:         0,
 		TotalRAM:           0,
@@ -301,12 +313,14 @@ func writeExcel(report []Report, unallocatedStorage int, unallocatedDisks []stri
 	f.SetCellValue(summarySheet, "B7", summaryData.TotalVCPUs)
 	f.SetCellValue(summarySheet, "A8", "Total RAM (GB)")
 	f.SetCellValue(summarySheet, "B8", summaryData.TotalRAM)
+	f.SetCellValue(summarySheet, "A9", "Total Snapshots")
+	f.SetCellValue(summarySheet, "B9", summaryData.TotalSnapshots)
 
 	// Write License Counts
-	f.SetCellValue(summarySheet, "A10", "License Type")
-	f.SetCellValue(summarySheet, "B10", "Count")
+	f.SetCellValue(summarySheet, "A11", "License Type")
+	f.SetCellValue(summarySheet, "B11", "Count")
 
-	row := 11
+	row := 12
 	for license, count := range summaryData.LicenseCounts {
 		f.SetCellValue(summarySheet, fmt.Sprintf("A%d", row), license)
 		f.SetCellValue(summarySheet, fmt.Sprintf("B%d", row), count)

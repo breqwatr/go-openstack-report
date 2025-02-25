@@ -9,21 +9,21 @@ BINARY_NAME=reportctl
 all: build
 
 # Build the project
-build: 
-    $(GOBUILD) -o $(BINARY_NAME) -v
+build:
+	$(GOBUILD) -o $(BINARY_NAME) -v  # <-- ✅ TAB here
 
 # Clean build files
-clean: 
-    $(GOCLEAN)
-    rm -f $(BINARY_NAME)
+clean:
+	$(GOCLEAN)                       # <-- ✅ TAB here
+	rm -f $(BINARY_NAME)              # <-- ✅ TAB here
 
 # Install dependencies
-deps: 
-    $(GOGET) -v ./...
+deps:
+	$(GOGET) -v ./...                 # <-- ✅ TAB here
 
 # Run the application
-run: 
-    $(GOBUILD) -o $(BINARY_NAME) -v
-    ./$(BINARY_NAME)
+run:
+	$(GOBUILD) -o $(BINARY_NAME) -v  # <-- ✅ TAB here
+	./$(BINARY_NAME)                  # <-- ✅ TAB here
 
 .PHONY: all build clean deps run
