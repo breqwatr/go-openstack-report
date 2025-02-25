@@ -44,3 +44,7 @@ Thumbs.db
 
 # Excel reports
 report-*.xlsx
+
+# Don't check in openrc.sh
+openrc.sh
+open-rc.sh
