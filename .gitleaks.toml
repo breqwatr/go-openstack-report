@@ -1,0 +1,11 @@
+# .gitleaks.toml
+[allowlist]
+  description = "Placeholder and example false positives"
+  regexes = [
+    '''your-api-key''',
+    '''Bearer your-''',
+  ]
+  paths = [
+    '''docs/''',
+  ]
+
