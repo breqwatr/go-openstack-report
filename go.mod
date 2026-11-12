@@ -3,7 +3,7 @@ module github.com/breqwatr/go-openstack-report
 go 1.26.0
 
 require (
-	github.com/gophercloud/gophercloud/v2 v2.13.0
+	github.com/gophercloud/gophercloud/v2 v2.15.0
 	github.com/xuri/excelize/v2 v2.11.1
 )
 
