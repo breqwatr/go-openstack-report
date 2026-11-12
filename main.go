@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,54 +17,89 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 )
 
-var flavorRegex = regexp.MustCompile(`v\d+\.c(\d+)r(\d+)`)
+const (
+	toolName    = "reportctl"
+	toolVersion = "0.3.0"
+)
 
-type FixedServer struct {
-	servers.Server
-	Addresses map[string]interface{} `json:"addresses"`
+// scope is the single project this report covers. Every collection is pinned to
+// it: the tool must never hand a customer another tenant's objects.
+type scope struct {
+	ProjectID   string
+	ProjectName string
 }
 
-type PricingConfig struct {
-	FloatingIPPrice float64            // per IP per month
-	StoragePrice    float64            // per GB per month
-	MemoryPrice     float64            // per GB per month
-	LicensePrices   map[string]float64 // license type -> price per month
-	FlavorPrices    map[string]float64 // flavor name -> additional price per month
+// resolveScope reads the project out of the token itself rather than trusting
+// OS_PROJECT_ID, which callers routinely set to a project name.
+func resolveScope(provider *gophercloud.ProviderClient) (scope, error) {
+	res, ok := provider.GetAuthResult().(tokens.CreateResult)
+	if !ok {
+		return scope{}, fmt.Errorf("unexpected auth result %T", provider.GetAuthResult())
+	}
+	p, err := res.ExtractProject()
+	if err != nil {
+		return scope{}, err
+	}
+	if p == nil || p.ID == "" {
+		return scope{}, fmt.Errorf("token is not project-scoped; set OS_PROJECT_NAME or OS_PROJECT_ID")
+	}
+	return scope{ProjectID: p.ID, ProjectName: p.Name}, nil
 }
 
-type Report struct {
-	VMName                string
-	Flavor                string
-	License               string
-	VMID                  string
-	DiskSizes             []int
-	FloatingIPs           []string
-	MonthlyStorageCost    float64
-	MonthlyMemoryCost     float64
-	MonthlyLicenseCost    float64
-	MonthlyFloatingIPCost float64
-	TotalMonthlyCost      float64
+// collection records the outcome of one API sweep. vMetaData reports these so a
+// partial failure is visible in the workbook rather than silently producing an
+// understated inventory.
+type collection struct {
+	Service string
+	Object  string
+	Count   int
+	Err     error
 }
 
-type Summary struct {
-	VMCount             int
-	TotalStorage        int
-	UnallocatedStorage  int
-	TotalFloatingIPs    int
-	TotalSnapshots      int
-	TotalSnapshotSize   int
-	LicenseCounts       map[string]int
-	TotalVCPUs          int
-	TotalRAM            int
-	TotalMonthlyCost    float64
-	TotalStorageCost    float64
-	TotalMemoryCost     float64
-	TotalLicenseCost    float64
-	TotalFloatingIPCost float64
+// inventory is the raw estate as collected, before any normalisation.
+type inventory struct {
+	Servers   []servers.Server
+	Flavors   []flavors.Flavor
+	Ports     []ports.Port
+	Volumes   []volumes.Volume
+	FIPs      []floatingips.FloatingIP
+	Snapshots []snapshots.Snapshot
+	Images    []images.Image
+
+	Collections []collection
+	AuthURL     string
+	Generated   time.Time
+	Scope       scope
+}
+
+func (inv *inventory) record(service, object string, count int, err error) {
+	inv.Collections = append(inv.Collections, collection{service, object, count, err})
+	if err != nil {
+		log.Printf("WARNING: %s/%s collection failed: %v", service, object, err)
+	}
+}
+
+func (inv *inventory) failed() int {
+	n := 0
+	for _, c := range inv.Collections {
+		if c.Err != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// sheetData is one tab: a header row plus rows of cell values.
+type sheetData struct {
+	Name    string
+	Headers []string
+	Rows    [][]any
 }
 
 func main() {
@@ -79,8 +112,8 @@ func main() {
 
 	if os.Getenv("OS_PROJECT_DOMAIN_ID") != "" {
 		opts.DomainID = os.Getenv("OS_PROJECT_DOMAIN_ID")
-	} else {
-		opts.DomainName = os.Getenv("OS_PROJECT_DOMAIN_NAME")
+	} else if v := os.Getenv("OS_PROJECT_DOMAIN_NAME"); v != "" {
+		opts.DomainName = v
 	}
 
 	provider, err := openstack.AuthenticatedClient(ctx, opts)
@@ -88,455 +121,874 @@ func main() {
 		log.Fatalf("Failed to authenticate: %v", err)
 	}
 
-	computeClient, err := openstack.NewComputeV2(provider, gophercloud.EndpointOpts{})
+	sc, err := resolveScope(provider)
 	if err != nil {
-		log.Fatalf("Failed to create compute client: %v", err)
+		log.Fatalf("Failed to determine project scope: %v", err)
+	}
+	log.Printf("Collecting inventory for project %s (%s)", sc.ProjectName, sc.ProjectID)
+
+	inv := &inventory{AuthURL: opts.IdentityEndpoint, Generated: time.Now(), Scope: sc}
+	collect(ctx, provider, inv)
+
+	idx := buildIndexes(inv)
+
+	sheets := []sheetData{
+		buildVBilling(inv, idx),
+		buildVInfo(inv, idx),
+		buildVFlavor(inv, idx),
+		buildVDisk(inv, idx),
+		buildVNetwork(inv, idx),
+		buildVSnapshot(inv, idx),
+		buildVHealth(inv, idx),
+		buildVMetaData(inv, idx),
 	}
 
-	storageClient, err := openstack.NewBlockStorageV3(provider, gophercloud.EndpointOpts{})
+	filename := fmt.Sprintf("report-%s.xlsx", inv.Generated.Format("2006-01-02"))
+	if err := writeWorkbook(filename, sheets); err != nil {
+		log.Fatalf("Failed to write %s: %v", filename, err)
+	}
+
+	log.Printf("Wrote %s", filename)
+	if n := inv.failed(); n > 0 {
+		log.Printf("WARNING: %d collection(s) failed; see the vHealth and vMetaData tabs. Inventory is INCOMPLETE.", n)
+		os.Exit(1)
+	}
+}
+
+// collect gathers every object type, recording per-service success or failure
+// rather than discarding errors.
+func collect(ctx context.Context, provider *gophercloud.ProviderClient, inv *inventory) {
+	compute, err := openstack.NewComputeV2(provider, gophercloud.EndpointOpts{})
 	if err != nil {
-		log.Fatalf("Failed to create storage client: %v", err)
-	}
+		inv.record("compute", "endpoint", 0, err)
+	} else {
+		if pages, err := servers.List(compute, servers.ListOpts{}).AllPages(ctx); err != nil {
+			inv.record("compute", "servers", 0, err)
+		} else {
+			inv.Servers, err = servers.ExtractServers(pages)
+			inv.record("compute", "servers", len(inv.Servers), err)
+		}
 
-	networkClient, err := openstack.NewNetworkV2(provider, gophercloud.EndpointOpts{})
-	if err != nil {
-		log.Fatalf("Failed to create network client: %v", err)
-	}
-
-	allVMs, _ := listFixedServers(ctx, computeClient)
-	allFlavors, _ := listFlavors(ctx, computeClient)
-	allPorts, _ := listPorts(ctx, networkClient)
-	allVolumes, _ := listVolumes(ctx, storageClient)
-	allFIPs, _ := listFloatingIPs(ctx, networkClient)
-	allSnapshots, _ := listSnapshots(ctx, storageClient)
-
-	flavorMap := make(map[string]string)
-	for _, flavor := range allFlavors {
-		flavorMap[flavor.ID] = flavor.Name
-	}
-
-	portToFIP := make(map[string][]string)
-	for _, fip := range allFIPs {
-		if fip.PortID != "" {
-			portToFIP[fip.PortID] = append(portToFIP[fip.PortID], fip.FloatingIP)
+		if pages, err := flavors.ListDetail(compute, flavors.ListOpts{}).AllPages(ctx); err != nil {
+			inv.record("compute", "flavors", 0, err)
+		} else {
+			inv.Flavors, err = flavors.ExtractFlavors(pages)
+			inv.record("compute", "flavors", len(inv.Flavors), err)
 		}
 	}
 
-	pricing := PricingConfig{
-		FloatingIPPrice: 5.00,  // $5 per floating IP per month
-		StoragePrice:    0.10,  // $0.10 per GB storage per month
-		MemoryPrice:     10.00, // $10.00 per GB RAM per month
-		LicensePrices: map[string]float64{
-			"windows": 8.00,   // $8 per 2-core bundle for Windows
-			"sql":     230.00, // $230 per 2-core bundle for SQL Server
-		},
-		FlavorPrices: map[string]float64{
-			// Add specific flavor surcharges if needed
-			"windows.large": 25.00, // Additional $25 for large Windows VMs
-		},
-	}
-
-	unallocatedStorage, unallocatedDisks, unallocatedDiskSizes := calculateUnallocatedStorage(allVolumes)
-	report := generateReport(allVMs, allPorts, allVolumes, portToFIP, flavorMap, pricing)
-
-	summaryData := generateSummary(report, unallocatedStorage, allSnapshots)
-	writeExcel(report, unallocatedStorage, unallocatedDisks, unallocatedDiskSizes, summaryData)
-}
-
-func listFixedServers(ctx context.Context, client *gophercloud.ServiceClient) ([]FixedServer, error) {
-	allPages, err := servers.List(client, nil).AllPages(ctx)
+	storage, err := openstack.NewBlockStorageV3(provider, gophercloud.EndpointOpts{})
 	if err != nil {
-		return nil, err
-	}
-
-	var allServers []FixedServer
-	err = servers.ExtractServersInto(allPages, &allServers)
-	return allServers, err
-}
-
-func listFlavors(ctx context.Context, client *gophercloud.ServiceClient) ([]flavors.Flavor, error) {
-	allPages, err := flavors.ListDetail(client, nil).AllPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return flavors.ExtractFlavors(allPages)
-}
-
-func listPorts(ctx context.Context, client *gophercloud.ServiceClient) ([]ports.Port, error) {
-	allPages, err := ports.List(client, nil).AllPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return ports.ExtractPorts(allPages)
-}
-
-func listVolumes(ctx context.Context, client *gophercloud.ServiceClient) ([]volumes.Volume, error) {
-	allPages, err := volumes.List(client, nil).AllPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return volumes.ExtractVolumes(allPages)
-}
-
-func listFloatingIPs(ctx context.Context, client *gophercloud.ServiceClient) ([]floatingips.FloatingIP, error) {
-	allPages, err := floatingips.List(client, nil).AllPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return floatingips.ExtractFloatingIPs(allPages)
-}
-
-func listSnapshots(ctx context.Context, client *gophercloud.ServiceClient) ([]snapshots.Snapshot, error) {
-	allPages, err := snapshots.List(client, nil).AllPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return snapshots.ExtractSnapshots(allPages)
-}
-
-func calculateUnallocatedStorage(vols []volumes.Volume) (int, []string, []int) {
-	totalUnallocated := 0
-	var unallocatedDisks []string
-	var unallocatedDiskSizes []int
-
-	for _, vol := range vols {
-		if len(vol.Attachments) == 0 {
-			totalUnallocated += vol.Size
-			unallocatedDisks = append(unallocatedDisks, vol.Name)
-			unallocatedDiskSizes = append(unallocatedDiskSizes, vol.Size)
-		}
-	}
-	return totalUnallocated, unallocatedDisks, unallocatedDiskSizes
-}
-
-// generateReport identifies boot disks and sorts extra volumes.
-func generateReport(vms []FixedServer, ports []ports.Port, vols []volumes.Volume, portToFIP map[string][]string, flavorMap map[string]string, pricing PricingConfig) []Report {
-	var report []Report
-
-	for _, vm := range vms {
-		licenseType := ""
-		if meta, exists := vm.Metadata["license_type"]; exists {
-			licenseType = fmt.Sprintf("%v", meta)
+		inv.record("blockstorage", "endpoint", 0, err)
+	} else {
+		if pages, err := volumes.List(storage, volumes.ListOpts{}).AllPages(ctx); err != nil {
+			inv.record("blockstorage", "volumes", 0, err)
+		} else {
+			inv.Volumes, err = volumes.ExtractVolumes(pages)
+			inv.record("blockstorage", "volumes", len(inv.Volumes), err)
 		}
 
-		flavor := flavorMap[vm.Flavor["id"].(string)]
-		var diskSizes []int
-		var floatingIPs []string
-		var bootDiskSize int
-		var extraDiskSizes []int
+		if pages, err := snapshots.List(storage, snapshots.ListOpts{}).AllPages(ctx); err != nil {
+			inv.record("blockstorage", "snapshots", 0, err)
+		} else {
+			inv.Snapshots, err = snapshots.ExtractSnapshots(pages)
+			inv.record("blockstorage", "snapshots", len(inv.Snapshots), err)
+		}
+	}
 
-		var attachedVolumes []volumes.Volume
+	network, err := openstack.NewNetworkV2(provider, gophercloud.EndpointOpts{})
+	if err != nil {
+		inv.record("network", "endpoint", 0, err)
+	} else {
+		if pages, err := ports.List(network, ports.ListOpts{ProjectID: inv.Scope.ProjectID}).AllPages(ctx); err != nil {
+			inv.record("network", "ports", 0, err)
+		} else {
+			inv.Ports, err = ports.ExtractPorts(pages)
+			inv.record("network", "ports", len(inv.Ports), err)
+		}
 
-		for _, vol := range vols {
-			for _, attachment := range vol.Attachments {
-				if attachment.ServerID == vm.ID {
-					attachedVolumes = append(attachedVolumes, vol)
-				}
+		if pages, err := floatingips.List(network, floatingips.ListOpts{ProjectID: inv.Scope.ProjectID}).AllPages(ctx); err != nil {
+			inv.record("network", "floatingips", 0, err)
+		} else {
+			inv.FIPs, err = floatingips.ExtractFloatingIPs(pages)
+			inv.record("network", "floatingips", len(inv.FIPs), err)
+		}
+	}
+
+	// Images resolve the OS column on vBilling and the image name on vInfo. A
+	// failure here degrades both to a raw image UUID, or to blank.
+	if image, err := openstack.NewImageV2(provider, gophercloud.EndpointOpts{}); err != nil {
+		inv.record("image", "endpoint", 0, err)
+	} else if pages, err := images.List(image, images.ListOpts{}).AllPages(ctx); err != nil {
+		inv.record("image", "images", 0, err)
+	} else {
+		inv.Images, err = images.ExtractImages(pages)
+		inv.record("image", "images", len(inv.Images), err)
+	}
+}
+
+// indexes holds the lookup maps, built once, so the tab builders stay linear
+// instead of rescanning every slice per VM.
+type indexes struct {
+	flavorByID  map[string]flavors.Flavor
+	imageByID   map[string]images.Image
+	serverByID  map[string]servers.Server
+	volumeByID  map[string]volumes.Volume
+	portsByVM   map[string][]ports.Port
+	portByID    map[string]ports.Port
+	fipsByPort  map[string][]floatingips.FloatingIP
+	volsByVM    map[string][]volumes.Volume
+	deviceOfVol map[string]string // volumeID|serverID -> /dev/vdX
+	flavorUsage map[string]int
+}
+
+func buildIndexes(inv *inventory) *indexes {
+	idx := &indexes{
+		flavorByID:  make(map[string]flavors.Flavor, len(inv.Flavors)),
+		imageByID:   make(map[string]images.Image, len(inv.Images)),
+		serverByID:  make(map[string]servers.Server, len(inv.Servers)),
+		volumeByID:  make(map[string]volumes.Volume, len(inv.Volumes)),
+		portsByVM:   make(map[string][]ports.Port),
+		portByID:    make(map[string]ports.Port, len(inv.Ports)),
+		fipsByPort:  make(map[string][]floatingips.FloatingIP),
+		volsByVM:    make(map[string][]volumes.Volume),
+		deviceOfVol: make(map[string]string),
+		flavorUsage: make(map[string]int),
+	}
+
+	for _, f := range inv.Flavors {
+		idx.flavorByID[f.ID] = f
+	}
+	for _, i := range inv.Images {
+		idx.imageByID[i.ID] = i
+	}
+	for _, s := range inv.Servers {
+		idx.serverByID[s.ID] = s
+		if id, _ := flavorRef(s); id != "" {
+			idx.flavorUsage[id]++
+		}
+	}
+	for _, v := range inv.Volumes {
+		idx.volumeByID[v.ID] = v
+		seen := make(map[string]bool, len(v.Attachments))
+		for _, a := range v.Attachments {
+			if a.ServerID == "" || seen[a.ServerID] {
+				continue // a multiattach volume can list the same server twice
 			}
+			seen[a.ServerID] = true
+			idx.volsByVM[a.ServerID] = append(idx.volsByVM[a.ServerID], v)
+			idx.deviceOfVol[v.ID+"|"+a.ServerID] = a.Device
+		}
+	}
+	for _, p := range inv.Ports {
+		idx.portByID[p.ID] = p
+		if p.DeviceID != "" {
+			idx.portsByVM[p.DeviceID] = append(idx.portsByVM[p.DeviceID], p)
+		}
+	}
+	for _, f := range inv.FIPs {
+		if f.PortID != "" {
+			idx.fipsByPort[f.PortID] = append(idx.fipsByPort[f.PortID], f)
+		}
+	}
+	return idx
+}
+
+// flavorRef safely pulls the flavor id and embedded name out of the server's
+// flavor object. Microversion 2.47+ omits "id" entirely, so neither is assumed.
+func flavorRef(s servers.Server) (id, name string) {
+	if s.Flavor == nil {
+		return "", ""
+	}
+	if v, ok := s.Flavor["id"].(string); ok {
+		id = v
+	}
+	if v, ok := s.Flavor["original_name"].(string); ok {
+		name = v
+	}
+	return id, name
+}
+
+func imageRef(s servers.Server) string {
+	if s.Image == nil {
+		return ""
+	}
+	if v, ok := s.Image["id"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (idx *indexes) fipsForVM(vmID string) []string {
+	var out []string
+	for _, p := range idx.portsByVM[vmID] {
+		for _, f := range idx.fipsByPort[p.ID] {
+			out = append(out, f.FloatingIP)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func buildVInfo(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vInfo", Headers: []string{
+		"VM Name", "Hostname", "VM ID", "Status", "Power State", "Task State", "Project ID",
+		"Availability Zone", "Flavor", "Flavor ID", "vCPUs", "RAM (MB)",
+		"Root Disk (GB)", "Image", "Image ID", "Key Name", "License", "Boot Source",
+		"Disks", "Disk Total (GB)", "NICs", "Floating IPs", "Locked", "Created",
+		"Updated", "Fault", "Properties",
+	}}
+
+	for _, vm := range inv.Servers {
+		flavorID, flavorName := flavorRef(vm)
+		var vcpus, ram, rootDisk any
+		if f, ok := idx.flavorByID[flavorID]; ok {
+			flavorName, vcpus, ram, rootDisk = f.Name, f.VCPUs, f.RAM, f.Disk
 		}
 
-		if len(attachedVolumes) > 0 {
-			sort.Slice(attachedVolumes, func(i, j int) bool {
-				return attachedVolumes[i].Name < attachedVolumes[j].Name
-			})
-
-			bootDiskSize = attachedVolumes[0].Size
-			for i, vol := range attachedVolumes {
-				if i == 0 {
-					continue
-				}
-				extraDiskSizes = append(extraDiskSizes, vol.Size)
-			}
+		imageID := imageRef(vm)
+		imageName := imageID
+		if img, ok := idx.imageByID[imageID]; ok {
+			imageName = img.Name
 		}
 
-		if bootDiskSize > 0 {
-			diskSizes = append(diskSizes, bootDiskSize)
+		vols := idx.volsByVM[vm.ID]
+		diskTotal := 0
+		for _, v := range vols {
+			diskTotal += v.Size
 		}
 
-		sort.Ints(extraDiskSizes)
-		diskSizes = append(diskSizes, extraDiskSizes...)
-
-		for _, port := range ports {
-			if port.DeviceID == vm.ID {
-				if ips, exists := portToFIP[port.ID]; exists {
-					floatingIPs = append(floatingIPs, ips...)
-				}
-			}
+		locked := false
+		if vm.Locked != nil {
+			locked = *vm.Locked
 		}
 
-		// Calculate costs
-		totalStorage := sum(diskSizes)
-		storageCost := float64(totalStorage) * pricing.StoragePrice
-
-		memoryCost := 0.0
-		licenseCost := 0.0
-		cores := 0
-
-		// Extract cores and memory from flavor regex
-		if matches := flavorRegex.FindStringSubmatch(flavor); len(matches) == 3 {
-			if c, err := strconv.Atoi(matches[1]); err == nil {
-				cores = c
-			}
-			if ram, err := strconv.Atoi(matches[2]); err == nil {
-				memoryCost = float64(ram) * pricing.MemoryPrice
-			}
-		}
-
-		// Calculate license cost based on 2-core bundles, minimum 4 cores
-		if cores > 0 {
-			licenseCores := cores
-			if licenseCores < 4 {
-				licenseCores = 4 // Minimum 4 cores for licensing
-			}
-			coreBundles := (licenseCores + 1) / 2 // Round up to nearest 2-core bundle
-			
-			licenseKey := strings.ToLower(licenseType)
-			// Check for license matches (including partial matches)
-			for licensePattern, pricePerBundle := range pricing.LicensePrices {
-				if strings.Contains(licenseKey, licensePattern) {
-					licenseCost = float64(coreBundles) * pricePerBundle
-					break
-				}
-			}
-		}
-
-		floatingIPCost := float64(len(floatingIPs)) * pricing.FloatingIPPrice
-		flavorCost := pricing.FlavorPrices[flavor] // Additional flavor-based costs
-
-		totalCost := storageCost + memoryCost + licenseCost + floatingIPCost + flavorCost
-
-		report = append(report, Report{
-			VMID:                  vm.ID,
-			VMName:                vm.Name,
-			Flavor:                flavor,
-			License:               licenseType,
-			DiskSizes:             diskSizes,
-			FloatingIPs:           floatingIPs,
-			MonthlyStorageCost:    storageCost,
-			MonthlyMemoryCost:     memoryCost,
-			MonthlyLicenseCost:    licenseCost,
-			MonthlyFloatingIPCost: floatingIPCost,
-			TotalMonthlyCost:      totalCost,
+		s.Rows = append(s.Rows, []any{
+			vm.Name, deref(vm.Hostname), vm.ID, vm.Status, vm.PowerState.String(), vm.TaskState, vm.TenantID,
+			vm.AvailabilityZone, flavorName, flavorID, vcpus, ram,
+			rootDisk, imageName, imageID, vm.KeyName, vm.Metadata["license_type"], bootSource(vm, vols),
+			len(vols), diskTotal, len(idx.portsByVM[vm.ID]), strings.Join(idx.fipsForVM(vm.ID), ", "),
+			yesNo(locked), ts(vm.Created), ts(vm.Updated), vm.Fault.Message, kvString(vm.Metadata),
 		})
 	}
-	return report
+
+	sortRows(s.Rows, 0, 1)
+	return s
 }
 
-// generateSummary generates a summary of the report including total storage, floating IPs, and license counts.
-func generateSummary(report []Report, unallocatedStorage int, allSnapshots []snapshots.Snapshot) Summary {
-	summary := Summary{
-		VMCount:             len(report),
-		TotalStorage:        0,
-		UnallocatedStorage:  unallocatedStorage,
-		TotalFloatingIPs:    0,
-		TotalSnapshots:      len(allSnapshots),
-		TotalSnapshotSize:   0,
-		LicenseCounts:       make(map[string]int),
-		TotalVCPUs:          0,
-		TotalRAM:            0,
-		TotalMonthlyCost:    0,
-		TotalStorageCost:    0,
-		TotalMemoryCost:     0,
-		TotalLicenseCost:    0,
-		TotalFloatingIPCost: 0,
+func buildVFlavor(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vFlavor", Headers: []string{
+		"Flavor Name", "Flavor ID", "vCPUs", "RAM (MB)", "Disk (GB)", "Ephemeral (GB)",
+		"Swap (MB)", "RxTx Factor", "Public", "VMs Using", "Description", "Extra Specs",
+	}}
+
+	for _, f := range inv.Flavors {
+		s.Rows = append(s.Rows, []any{
+			f.Name, f.ID, f.VCPUs, f.RAM, f.Disk, f.Ephemeral,
+			f.Swap, f.RxTxFactor, yesNo(f.IsPublic), idx.flavorUsage[f.ID], f.Description, kvString(f.ExtraSpecs),
+		})
 	}
 
-	// Loop through each VM in the report
-	for _, entry := range report {
-		summary.TotalStorage += sum(entry.DiskSizes)
-		summary.TotalFloatingIPs += len(entry.FloatingIPs)
+	sortRows(s.Rows, 0, 1)
+	return s
+}
 
-		// Sum up costs
-		summary.TotalMonthlyCost += entry.TotalMonthlyCost
-		summary.TotalStorageCost += entry.MonthlyStorageCost
-		summary.TotalMemoryCost += entry.MonthlyMemoryCost
-		summary.TotalLicenseCost += entry.MonthlyLicenseCost
-		summary.TotalFloatingIPCost += entry.MonthlyFloatingIPCost
+// buildVDisk emits one row per volume attachment, plus one row per unattached
+// volume, replacing the old dynamic "Disk 1..N" columns.
+func buildVDisk(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vDisk", Headers: []string{
+		"VM Name", "VM ID", "Device", "Volume Name", "Volume ID", "Size (GB)",
+		"Volume Type", "Bootable", "Encrypted", "Multiattach", "Attached", "Status",
+		"Availability Zone", "Project ID", "Created",
+	}}
 
-		// Count licenses
-		license := entry.License
-		if license == "" || license == "null" {
-			license = "Generic OS"
-		}
-		summary.LicenseCounts[license]++
-
-		matches := flavorRegex.FindStringSubmatch(entry.Flavor)
-		if len(matches) == 3 {
-			vCPUs, _ := strconv.Atoi(matches[1])
-			RAM, _ := strconv.Atoi(matches[2])
-			summary.TotalVCPUs += vCPUs
-			summary.TotalRAM += RAM
+	row := func(vmName, vmID, device string, v volumes.Volume, attached bool) []any {
+		return []any{
+			vmName, vmID, device, v.Name, v.ID, v.Size,
+			v.VolumeType, v.Bootable, yesNo(v.Encrypted), yesNo(v.Multiattach), yesNo(attached), v.Status,
+			v.AvailabilityZone, v.TenantID, ts(v.CreatedAt),
 		}
 	}
 
-	// Calculate total snapshot size
-	for _, snap := range allSnapshots {
-		summary.TotalSnapshotSize += snap.Size
+	for _, v := range inv.Volumes {
+		seen := make(map[string]bool, len(v.Attachments))
+		attached := false
+		for _, a := range v.Attachments {
+			if a.ServerID == "" || seen[a.ServerID] {
+				continue
+			}
+			seen[a.ServerID] = true
+			attached = true
+			name := ""
+			if vm, ok := idx.serverByID[a.ServerID]; ok {
+				name = vm.Name
+			}
+			s.Rows = append(s.Rows, row(name, a.ServerID, a.Device, v, true))
+		}
+		if !attached {
+			s.Rows = append(s.Rows, row("", "", "", v, false))
+		}
 	}
 
-	return summary
+	sortRows(s.Rows, 0, 2, 4)
+	return s
 }
 
-func sum(arr []int) int {
-	total := 0
-	for _, v := range arr {
-		total += v
+func buildVNetwork(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vNetwork", Headers: []string{
+		"VM Name", "VM ID", "Port ID", "Port Name", "Status", "MAC Address",
+		"Fixed IPs", "Floating IPs", "Network ID", "Device Owner", "Security Groups",
+		"Admin State Up", "Project ID", "Created",
+	}}
+
+	for _, p := range inv.Ports {
+		vmName := ""
+		if vm, ok := idx.serverByID[p.DeviceID]; ok {
+			vmName = vm.Name
+		}
+		var fips []string
+		for _, f := range idx.fipsByPort[p.ID] {
+			fips = append(fips, f.FloatingIP)
+		}
+		sort.Strings(fips)
+
+		s.Rows = append(s.Rows, []any{
+			vmName, p.DeviceID, p.ID, p.Name, p.Status, p.MACAddress,
+			fixedIPs(p), strings.Join(fips, ", "), p.NetworkID, p.DeviceOwner, strings.Join(p.SecurityGroups, ", "),
+			yesNo(p.AdminStateUp), p.ProjectID, ts(p.CreatedAt),
+		})
 	}
-	return total
+
+	sortRows(s.Rows, 0, 2)
+	return s
 }
 
-func excelColumn(n int) string {
-	letters := ""
-	for n > 0 {
-		n--
-		letters = fmt.Sprintf("%c", 'A'+(n%26)) + letters
-		n /= 26
+func buildVSnapshot(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vSnapshot", Headers: []string{
+		"Snapshot Name", "Snapshot ID", "Status", "Size (GB)", "Volume Name",
+		"Volume ID", "Progress", "Description", "Created",
+	}}
+
+	for _, sn := range inv.Snapshots {
+		volName := ""
+		if v, ok := idx.volumeByID[sn.VolumeID]; ok {
+			volName = v.Name
+		}
+		s.Rows = append(s.Rows, []any{
+			sn.Name, sn.ID, sn.Status, sn.Size, volName,
+			sn.VolumeID, sn.Progress, sn.Description, ts(sn.CreatedAt),
+		})
 	}
-	return letters
+
+	sortRows(s.Rows, 0, 1)
+	return s
 }
 
-func writeExcel(report []Report, unallocatedStorage int, unallocatedDisks []string, unallocatedDiskSizes []int, summaryData Summary) {
-	timestamp := time.Now().Format("2006-01-02")
-	filename := fmt.Sprintf("report-%s.xlsx", timestamp)
-
-	f := excelize.NewFile()
-
-	createSummarySheet(f, summaryData, unallocatedStorage)
-	createVMReportSheet(f, report)
-	createUnallocatedDisksSheet(f, unallocatedDisks, unallocatedDiskSizes)
-
-	// Delete the default "Sheet1"
-	if err := f.DeleteSheet("Sheet1"); err != nil {
-		log.Fatalf("Failed to delete default sheet: %v", err)
+// buildVHealth is the derived tab: problems worth acting on, not raw inventory.
+func buildVHealth(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vHealth", Headers: []string{
+		"Severity", "Category", "Object Type", "Object", "Object ID", "Detail",
+	}}
+	add := func(sev, cat, typ, name, id, detail string) {
+		s.Rows = append(s.Rows, []any{sev, cat, typ, name, id, detail})
 	}
 
-	if err := f.SaveAs(filename); err != nil {
-		log.Fatalf("Failed to save Excel file: %v", err)
-	}
-}
-
-func createSummarySheet(f *excelize.File, summaryData Summary, unallocatedStorage int) {
-	summarySheet := "Summary"
-	summaryIndex, err := f.NewSheet(summarySheet)
-	if err != nil {
-		log.Fatalf("Failed to create summary sheet: %v", err)
+	for _, c := range inv.Collections {
+		if c.Err != nil {
+			add("ERROR", "Collection", "Service", c.Service+"/"+c.Object, "",
+				"Collection failed, inventory is incomplete: "+c.Err.Error())
+		}
 	}
 
-	f.SetCellValue(summarySheet, "A1", "Summary Report")
-	f.SetCellValue(summarySheet, "A3", "Total VM Count")
-	f.SetCellValue(summarySheet, "B3", summaryData.VMCount)
-	f.SetCellValue(summarySheet, "A4", "Total Storage (GB)")
-	f.SetCellValue(summarySheet, "B4", summaryData.TotalStorage)
-	f.SetCellValue(summarySheet, "A5", "Unallocated Storage (GB)")
-	f.SetCellValue(summarySheet, "B5", unallocatedStorage)
-	f.SetCellValue(summarySheet, "A6", "Total Snapshots")
-	f.SetCellValue(summarySheet, "B6", summaryData.TotalSnapshots)
-	f.SetCellValue(summarySheet, "A7", "Total Snapshot Size (GB)")
-	f.SetCellValue(summarySheet, "B7", summaryData.TotalSnapshotSize)
-	f.SetCellValue(summarySheet, "A8", "Total Floating IPs")
-	f.SetCellValue(summarySheet, "B8", summaryData.TotalFloatingIPs)
-	f.SetCellValue(summarySheet, "A9", "Total vCPUs")
-	f.SetCellValue(summarySheet, "B9", summaryData.TotalVCPUs)
-	f.SetCellValue(summarySheet, "A10", "Total RAM (GB)")
-	f.SetCellValue(summarySheet, "B10", summaryData.TotalRAM)
+	// Defence in depth: if any API ever returns an object outside the scoped
+	// project, say so loudly rather than quietly shipping it to a customer.
+	foreign := func(typ, name, id, project string) {
+		if project != "" && project != inv.Scope.ProjectID {
+			add("ERROR", "Scope", typ, name, id,
+				"Object belongs to project "+project+", outside the reported scope "+inv.Scope.ProjectID)
+		}
+	}
+	for _, vm := range inv.Servers {
+		foreign("VM", vm.Name, vm.ID, vm.TenantID)
+	}
+	for _, v := range inv.Volumes {
+		foreign("Volume", v.Name, v.ID, v.TenantID)
+	}
+	for _, sn := range inv.Snapshots {
+		foreign("Snapshot", sn.Name, sn.ID, sn.ProjectID)
+	}
+	for _, p := range inv.Ports {
+		foreign("Port", p.Name, p.ID, p.ProjectID)
+	}
+	for _, f := range inv.FIPs {
+		foreign("Floating IP", f.FloatingIP, f.ID, f.ProjectID)
+	}
 
-	f.SetCellValue(summarySheet, "A12", "Total Monthly Cost")
-	f.SetCellValue(summarySheet, "B12", summaryData.TotalMonthlyCost)
+	for _, vm := range inv.Servers {
+		switch {
+		case strings.EqualFold(vm.Status, "ERROR"):
+			detail := vm.Fault.Message
+			if detail == "" {
+				detail = "VM is in ERROR state"
+			}
+			add("ERROR", "Compute", "VM", vm.Name, vm.ID, detail)
+		case strings.EqualFold(vm.Status, "SHUTOFF"):
+			add("INFO", "Compute", "VM", vm.Name, vm.ID, "VM is powered off but still consuming storage")
+		}
+		if id, name := flavorRef(vm); id != "" {
+			if _, ok := idx.flavorByID[id]; !ok {
+				ref := id
+				if name != "" {
+					ref = fmt.Sprintf("%s (%s)", name, id)
+				}
+				add("WARNING", "Compute", "VM", vm.Name, vm.ID,
+					"References flavor "+ref+" which no longer exists")
+			}
+		}
+		if len(idx.portsByVM[vm.ID]) == 0 {
+			add("WARNING", "Network", "VM", vm.Name, vm.ID, "VM has no network ports")
+		}
+	}
 
-	f.SetCellValue(summarySheet, "D3", "Cost Breakdown")
-	f.SetCellValue(summarySheet, "D4", "Storage Cost")
-	f.SetCellValue(summarySheet, "E4", summaryData.TotalStorageCost)
-	f.SetCellValue(summarySheet, "D5", "Memory Cost")
-	f.SetCellValue(summarySheet, "E5", summaryData.TotalMemoryCost)
-	f.SetCellValue(summarySheet, "D6", "License Cost")
-	f.SetCellValue(summarySheet, "E6", summaryData.TotalLicenseCost)
-	f.SetCellValue(summarySheet, "D7", "Floating IP Cost")
-	f.SetCellValue(summarySheet, "E7", summaryData.TotalFloatingIPCost)
+	for _, v := range inv.Volumes {
+		if strings.Contains(strings.ToLower(v.Status), "error") {
+			add("ERROR", "Storage", "Volume", v.Name, v.ID, "Volume status is "+v.Status)
+		}
+		if len(v.Attachments) == 0 {
+			add("WARNING", "Storage", "Volume", v.Name, v.ID,
+				fmt.Sprintf("Unattached volume consuming %d GB", v.Size))
+			continue
+		}
+		for _, a := range v.Attachments {
+			if _, ok := idx.serverByID[a.ServerID]; !ok && a.ServerID != "" {
+				add("ERROR", "Storage", "Volume", v.Name, v.ID,
+					"Attached to server "+a.ServerID+" which was not found")
+			}
+		}
+	}
 
-	// Format cost cells as USD currency
-	currencyStyle, _ := f.NewStyle(&excelize.Style{
-		NumFmt: 7, // USD currency format
+	for _, sn := range inv.Snapshots {
+		if strings.Contains(strings.ToLower(sn.Status), "error") {
+			add("ERROR", "Storage", "Snapshot", sn.Name, sn.ID, "Snapshot status is "+sn.Status)
+		}
+		if _, ok := idx.volumeByID[sn.VolumeID]; !ok {
+			add("WARNING", "Storage", "Snapshot", sn.Name, sn.ID,
+				fmt.Sprintf("Orphaned, source volume %s not found, consuming %d GB", sn.VolumeID, sn.Size))
+		}
+	}
+
+	for _, f := range inv.FIPs {
+		if f.PortID == "" {
+			add("WARNING", "Network", "Floating IP", f.FloatingIP, f.ID, "Allocated but not associated with any port")
+		}
+	}
+
+	for _, p := range inv.Ports {
+		if p.DeviceID == "" {
+			add("WARNING", "Network", "Port", p.Name, p.ID, "Port has no device attached")
+		}
+	}
+
+	rank := map[string]int{"ERROR": 0, "WARNING": 1, "INFO": 2}
+	sort.SliceStable(s.Rows, func(i, j int) bool {
+		a, b := s.Rows[i], s.Rows[j]
+		if ra, rb := rank[a[0].(string)], rank[b[0].(string)]; ra != rb {
+			return ra < rb
+		}
+		for _, c := range []int{1, 2, 3} {
+			if a[c].(string) != b[c].(string) {
+				return a[c].(string) < b[c].(string)
+			}
+		}
+		return false
 	})
-	f.SetCellStyle(summarySheet, "B12", "B12", currencyStyle)
-	f.SetCellStyle(summarySheet, "E4", "E7", currencyStyle)
-
-	f.SetCellValue(summarySheet, "A14", "License Type")
-	f.SetCellValue(summarySheet, "B14", "Count")
-
-	row := 16
-	for license, count := range summaryData.LicenseCounts {
-		f.SetCellValue(summarySheet, fmt.Sprintf("A%d", row), license)
-		f.SetCellValue(summarySheet, fmt.Sprintf("B%d", row), count)
-		row++
-	}
-
-	f.SetActiveSheet(summaryIndex)
+	return s
 }
 
-func createVMReportSheet(f *excelize.File, report []Report) {
-	vmSheet := "VM Report"
-	_, err := f.NewSheet(vmSheet)
-	if err != nil {
-		log.Fatalf("Failed to create VM report sheet: %v", err)
+func buildVMetaData(inv *inventory, idx *indexes) sheetData {
+	s := sheetData{Name: "vMetaData", Headers: []string{"Section", "Item", "Value"}}
+	add := func(section, item string, value any) {
+		s.Rows = append(s.Rows, []any{section, item, value})
 	}
 
-	header := []string{"VM Name", "Flavor", "License", "VM ID"}
-	maxDisks := 0
-	for _, entry := range report {
-		if len(entry.DiskSizes) > maxDisks {
-			maxDisks = len(entry.DiskSizes)
+	add("Report", "Generated", ts(inv.Generated))
+	add("Report", "Tool", toolName)
+	add("Report", "Version", toolVersion)
+	add("Report", "Auth URL", inv.AuthURL)
+	add("Report", "Project", inv.Scope.ProjectName)
+	add("Report", "Project ID", inv.Scope.ProjectID)
+	add("Report", "Scope", "single project")
+
+	for _, c := range inv.Collections {
+		status := fmt.Sprintf("OK, %d collected", c.Count)
+		if c.Err != nil {
+			status = "FAILED: " + c.Err.Error()
+		}
+		add("Collection", c.Service+"/"+c.Object, status)
+	}
+
+	var vcpus, ram, attached, unattached, snapSize, unassociated int
+	for _, vm := range inv.Servers {
+		if id, _ := flavorRef(vm); id != "" {
+			if f, ok := idx.flavorByID[id]; ok {
+				vcpus += f.VCPUs
+				ram += f.RAM
+			}
 		}
 	}
-	for i := 1; i <= maxDisks; i++ {
-		header = append(header, fmt.Sprintf("Disk %d Size (GB)", i))
-	}
-	header = append(header, "Floating IPs", "Storage Cost", "Memory Cost", "License Cost", "Floating IP Cost", "Total Monthly Cost")
-
-	for col, h := range header {
-		f.SetCellValue(vmSheet, excelColumn(col+1)+"1", h)
-	}
-
-	for row, entry := range report {
-		rowNum := row + 2
-		f.SetCellValue(vmSheet, excelColumn(1)+strconv.Itoa(rowNum), entry.VMName)
-		f.SetCellValue(vmSheet, excelColumn(2)+strconv.Itoa(rowNum), entry.Flavor)
-		f.SetCellValue(vmSheet, excelColumn(3)+strconv.Itoa(rowNum), entry.License)
-		f.SetCellValue(vmSheet, excelColumn(4)+strconv.Itoa(rowNum), entry.VMID)
-
-		for i, size := range entry.DiskSizes {
-			f.SetCellValue(vmSheet, excelColumn(5+i)+strconv.Itoa(rowNum), size)
-		}
-
-		col := 5 + maxDisks
-		f.SetCellValue(vmSheet, excelColumn(col)+strconv.Itoa(rowNum), strings.Join(entry.FloatingIPs, ", "))
-		f.SetCellValue(vmSheet, excelColumn(col+1)+strconv.Itoa(rowNum), entry.MonthlyStorageCost)
-		f.SetCellValue(vmSheet, excelColumn(col+2)+strconv.Itoa(rowNum), entry.MonthlyMemoryCost)
-		f.SetCellValue(vmSheet, excelColumn(col+3)+strconv.Itoa(rowNum), entry.MonthlyLicenseCost)
-		f.SetCellValue(vmSheet, excelColumn(col+4)+strconv.Itoa(rowNum), entry.MonthlyFloatingIPCost)
-		f.SetCellValue(vmSheet, excelColumn(col+5)+strconv.Itoa(rowNum), entry.TotalMonthlyCost)
-		
-		// Format cost columns as USD currency
-		currencyStyle, _ := f.NewStyle(&excelize.Style{
-			NumFmt: 7, // USD currency format
-		})
-		for i := 1; i <= 5; i++ {
-			f.SetCellStyle(vmSheet, excelColumn(col+i)+strconv.Itoa(rowNum), excelColumn(col+i)+strconv.Itoa(rowNum), currencyStyle)
+	for _, v := range inv.Volumes {
+		if len(v.Attachments) == 0 {
+			unattached += v.Size
+		} else {
+			attached += v.Size
 		}
 	}
+	for _, sn := range inv.Snapshots {
+		snapSize += sn.Size
+	}
+	for _, f := range inv.FIPs {
+		if f.PortID == "" {
+			unassociated++
+		}
+	}
+
+	add("Totals", "VMs", len(inv.Servers))
+	add("Totals", "vCPUs", vcpus)
+	add("Totals", "RAM (GB)", ram/1024)
+	add("Totals", "Flavors", len(inv.Flavors))
+	add("Totals", "Volumes", len(inv.Volumes))
+	add("Totals", "Attached Storage (GB)", attached)
+	add("Totals", "Unattached Storage (GB)", unattached)
+	add("Totals", "Snapshots", len(inv.Snapshots))
+	add("Totals", "Snapshot Size (GB)", snapSize)
+	add("Totals", "Ports", len(inv.Ports))
+	add("Totals", "Floating IPs", len(inv.FIPs))
+	add("Totals", "Unassociated Floating IPs", unassociated)
+
+	return s
 }
 
-func createUnallocatedDisksSheet(f *excelize.File, unallocatedDisks []string, unallocatedDiskSizes []int) {
-	unallocatedSheet := "Unallocated Disks"
-	_, err := f.NewSheet(unallocatedSheet)
+func writeWorkbook(filename string, sheets []sheetData) error {
+	f := excelize.NewFile()
+	defer f.Close()
+
+	headerStyle, err := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true},
+		Fill: excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"#DDEBF7"}},
+	})
 	if err != nil {
-		log.Fatalf("Failed to create Unallocated Disks sheet: %v", err)
+		return err
 	}
 
-	f.SetCellValue(unallocatedSheet, "A1", "Unallocated Disk Name")
-	f.SetCellValue(unallocatedSheet, "B1", "Size (GB)")
-
-	for i, disk := range unallocatedDisks {
-		f.SetCellValue(unallocatedSheet, fmt.Sprintf("A%d", i+2), disk)
-		f.SetCellValue(unallocatedSheet, fmt.Sprintf("B%d", i+2), unallocatedDiskSizes[i])
+	for _, s := range sheets {
+		if err := writeSheet(f, s, headerStyle); err != nil {
+			return fmt.Errorf("sheet %s: %w", s.Name, err)
+		}
 	}
+
+	if err := f.DeleteSheet("Sheet1"); err != nil {
+		return err
+	}
+	if idx, err := f.GetSheetIndex(sheets[0].Name); err == nil {
+		f.SetActiveSheet(idx)
+	}
+	return f.SaveAs(filename)
+}
+
+func writeSheet(f *excelize.File, s sheetData, headerStyle int) error {
+	if _, err := f.NewSheet(s.Name); err != nil {
+		return err
+	}
+	if err := f.SetSheetRow(s.Name, "A1", &s.Headers); err != nil {
+		return err
+	}
+	for i := range s.Rows {
+		cell, err := excelize.CoordinatesToCellName(1, i+2)
+		if err != nil {
+			return err
+		}
+		if err := f.SetSheetRow(s.Name, cell, &s.Rows[i]); err != nil {
+			return err
+		}
+	}
+
+	lastCol, err := excelize.ColumnNumberToName(len(s.Headers))
+	if err != nil {
+		return err
+	}
+	if err := f.SetCellStyle(s.Name, "A1", lastCol+"1", headerStyle); err != nil {
+		return err
+	}
+	if err := f.SetPanes(s.Name, &excelize.Panes{
+		Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft",
+	}); err != nil {
+		return err
+	}
+	if err := f.AutoFilter(s.Name, fmt.Sprintf("A1:%s%d", lastCol, len(s.Rows)+1), nil); err != nil {
+		return err
+	}
+
+	// Size each column to its widest value, capped so a long fault message or
+	// extra-specs blob does not push the rest of the sheet off screen.
+	for c, h := range s.Headers {
+		width := len(h)
+		for _, row := range s.Rows {
+			if c < len(row) {
+				if n := len(fmt.Sprintf("%v", row[c])); n > width {
+					width = n
+				}
+			}
+		}
+		name, err := excelize.ColumnNumberToName(c + 1)
+		if err != nil {
+			return err
+		}
+		if err := f.SetColWidth(s.Name, name, name, float64(min(width+2, 60))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sortRows orders rows by the given column indexes so successive runs of the
+// tool produce diffable workbooks.
+func sortRows(rows [][]any, cols ...int) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, c := range cols {
+			a := fmt.Sprintf("%v", rows[i][c])
+			b := fmt.Sprintf("%v", rows[j][c])
+			if a != b {
+				return a < b
+			}
+		}
+		return false
+	})
+}
+
+func fixedIPs(p ports.Port) string {
+	out := make([]string, 0, len(p.FixedIPs))
+	for _, ip := range p.FixedIPs {
+		out = append(out, ip.IPAddress)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+func kvString(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+m[k])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func ts(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// deref renders an optional string field, several of which Nova returns as null
+// when the caller lacks the policy for extended server attributes.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// ---------------------------------------------------------------------------
+// vBilling.
+//
+// One row per VM, disks spread across columns, in the RVTools wide idiom. A
+// volume or address with no VM attached gets its own row, keyed "unassigned",
+// which is the whole point: it is billed whether or not anything is using it,
+// and a blank cell reads as missing data rather than as a charge.
+// ---------------------------------------------------------------------------
+
+// unassigned keys the rows for objects no VM is using. Named rather than blank
+// so a reader scanning the VM column sees a thing they are paying for instead
+// of skimming past an empty cell.
+const unassigned = "unassigned"
+
+// bootSource reports where a server's root disk lives. It decides whether the
+// flavor's disk is real local storage or merely the shape of a root that is
+// actually a Cinder volume listed among the disks in its own right.
+func bootSource(vm servers.Server, vols []volumes.Volume) string {
+	for _, v := range vols {
+		if strings.EqualFold(v.Bootable, "true") {
+			return "volume"
+		}
+	}
+	if imageRef(vm) == "" {
+		return "unknown"
+	}
+	return "image"
+}
+
+// vmDisks lists a VM's disks in GB, left to right. An image-booted VM leads
+// with its flavor root plus ephemeral: that is real local storage which nothing
+// else on this sheet would show. A volume-booted VM does not, because its root
+// IS one of the volumes that follow and counting the flavor disk as well would
+// bill it twice.
+func vmDisks(vm servers.Server, idx *indexes) []int {
+	vols := idx.volsByVM[vm.ID]
+	var out []int
+
+	id, _ := flavorRef(vm)
+	if f, ok := idx.flavorByID[id]; ok && bootSource(vm, vols) != "volume" {
+		if n := f.Disk + f.Ephemeral; n > 0 {
+			out = append(out, n)
+		}
+	}
+
+	// Order by device path so a VM's disks land in the same columns run to run.
+	sorted := append([]volumes.Volume(nil), vols...)
+	sort.Slice(sorted, func(i, j int) bool {
+		di := idx.deviceOfVol[sorted[i].ID+"|"+vm.ID]
+		dj := idx.deviceOfVol[sorted[j].ID+"|"+vm.ID]
+		if (di == "") != (dj == "") {
+			return dj == "" // a known device path comes before an unknown one
+		}
+		if di != dj {
+			return di < dj
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	for _, v := range sorted {
+		out = append(out, v.Size)
+	}
+	return out
+}
+
+// osName is the Glance image the VM booted. Nova reports no guest OS, so the
+// image is the closest thing there is. A volume-booted VM has no image of its
+// own, so the name comes from the metadata Cinder copies onto the volume.
+func osName(vm servers.Server, idx *indexes) string {
+	if img, ok := idx.imageByID[imageRef(vm)]; ok {
+		return img.Name
+	}
+	for _, v := range idx.volsByVM[vm.ID] {
+		if !strings.EqualFold(v.Bootable, "true") {
+			continue
+		}
+		if n := v.VolumeImageMetadata["image_name"]; n != "" {
+			return n
+		}
+		if img, ok := idx.imageByID[v.VolumeImageMetadata["image_id"]]; ok {
+			return img.Name
+		}
+	}
+	return ""
+}
+
+func buildVBilling(inv *inventory, idx *indexes) sheetData {
+	// rank keeps the VMs together at the top, then the disks with no VM, then
+	// the addresses with no VM, rather than interleaving them on a blank name.
+	type entry struct {
+		rank   int
+		vmName string
+		flavor string
+		os     string
+		disks  []int
+		fip    string
+	}
+	var entries []entry
+	widest := 1
+
+	for _, vm := range inv.Servers {
+		_, flavorName := flavorRef(vm)
+		if id, _ := flavorRef(vm); id != "" {
+			if f, ok := idx.flavorByID[id]; ok {
+				flavorName = f.Name
+			}
+		}
+		e := entry{0, vm.Name, flavorName, osName(vm, idx), vmDisks(vm, idx), strings.Join(idx.fipsForVM(vm.ID), ", ")}
+		entries = append(entries, e)
+		widest = max(widest, len(e.disks))
+	}
+
+	// A volume nothing is attached to. Available is the common case, but a
+	// volume stuck in error or reserved is holding capacity just the same.
+	for _, v := range inv.Volumes {
+		attached := false
+		for _, a := range v.Attachments {
+			if a.ServerID != "" {
+				attached = true
+				break
+			}
+		}
+		if !attached {
+			entries = append(entries, entry{rank: 1, vmName: unassigned, disks: []int{v.Size}})
+		}
+	}
+
+	// Same rule applied to addresses: a floating IP held by the project but not
+	// bound to a VM is still billed, and has no VM to sit behind either.
+	for _, f := range inv.FIPs {
+		if _, id := idx.vmForFIP(f); id == "" {
+			entries = append(entries, entry{rank: 2, vmName: unassigned, fip: f.FloatingIP})
+		}
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if a.rank != b.rank {
+			return a.rank < b.rank
+		}
+		if a.vmName != b.vmName {
+			return a.vmName < b.vmName
+		}
+		return a.fip < b.fip
+	})
+
+	s := sheetData{Name: "vBilling", Headers: []string{"VM Name", "Flavor", "OS"}}
+	for i := 1; i <= widest; i++ {
+		s.Headers = append(s.Headers, fmt.Sprintf("Disk %d", i))
+	}
+	s.Headers = append(s.Headers, "Floating IP")
+
+	for _, e := range entries {
+		row := []any{e.vmName, e.flavor, e.os}
+		for i := 0; i < widest; i++ {
+			if i < len(e.disks) {
+				row = append(row, e.disks[i]) // GB, so the disk columns sum
+			} else {
+				row = append(row, nil)
+			}
+		}
+		s.Rows = append(s.Rows, append(row, e.fip))
+	}
+	return s
+}
+
+// vmForFIP resolves a floating IP to the VM behind its port. Neutron records
+// only the port, so an unbound address, or one bound to a router or load
+// balancer, resolves to no VM at all. That is not an error: it is exactly the
+// case that has to get its own row instead of vanishing.
+func (idx *indexes) vmForFIP(f floatingips.FloatingIP) (name, id string) {
+	p, ok := idx.portByID[f.PortID]
+	if !ok {
+		return "", ""
+	}
+	if vm, ok := idx.serverByID[p.DeviceID]; ok {
+		return vm.Name, vm.ID
+	}
+	return "", ""
 }

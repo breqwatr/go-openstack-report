@@ -5,6 +5,10 @@
 *.so
 *.dylib
 
+# The compiled tool. A Go binary has no extension, so the patterns above miss
+# it; this is BINARY_NAME from the Makefile, built into the repo root.
+/reportctl
+
 # Output of the go coverage tool
 *.out
 
@@ -42,9 +46,13 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
-# Excel reports
+# Excel reports, and the lock files Excel leaves beside an open one
 report-*.xlsx
+~$*
 
-# Don't check in openrc.sh
-openrc.sh
-open-rc.sh
+# Credentials. These matched only the bare filenames, so a real openrc saved
+# under any prefix (admin-openrc.sh, prod-openrc.sh) was committable. Match the
+# suffix instead and keep the checked-in template explicitly.
+*openrc.sh
+*open-rc.sh
+!example-open-rc.sh

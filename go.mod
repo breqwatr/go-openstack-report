@@ -1,4 +1,4 @@
-module github.com/breqwatr/billing
+module github.com/breqwatr/go-openstack-report
 
 go 1.25.0
 
